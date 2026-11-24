@@ -24,7 +24,7 @@ export async function buildApp(config: Config, db: Db): Promise<FastifyInstance>
 
   await app.register(cors, {
     origin: config.dashboardOrigins,
-    methods: ['GET', 'POST', 'PATCH'],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Authorization', 'Content-Type'],
     maxAge: 600,
   })
@@ -108,17 +108,22 @@ export async function buildApp(config: Config, db: Db): Promise<FastifyInstance>
 
     /**
      * Counts for the filters: every site with a key plus any site that has rows, and every
-     * traffic source that has rows (busiest first).
+     * traffic source that has rows (busiest first). Totals count active leads only (new and
+     * contacted); archived leads are counted separately for the Archived view.
      */
     dashboard.get('/v1/summary', async () => {
       const [siteRows, channelRows] = await Promise.all([
-        db.query<{ site: string; total: number; new_count: number; last_received_at: Date | null }>(
-          `select site, count(*)::int as total, (count(*) filter (where status = 'new'))::int as new_count,
+        db.query<{ site: string; total: number; new_count: number; archived_count: number; last_received_at: Date | null }>(
+          `select site,
+                  (count(*) filter (where status <> 'archived'))::int as total,
+                  (count(*) filter (where status = 'new'))::int as new_count,
+                  (count(*) filter (where status = 'archived'))::int as archived_count,
                   max(received_at) as last_received_at
              from submissions group by site`,
         ),
         db.query<{ channel: string; total: number }>(
-          'select channel, count(*)::int as total from submissions group by channel order by total desc, channel',
+          `select channel, count(*)::int as total from submissions where status <> 'archived'
+            group by channel order by total desc, channel`,
         ),
       ])
       const bySite = new Map(siteRows.rows.map((row) => [row.site, row]))
@@ -129,6 +134,7 @@ export async function buildApp(config: Config, db: Db): Promise<FastifyInstance>
           label: config.siteLabels.get(site) ?? null,
           total: bySite.get(site)?.total ?? 0,
           newCount: bySite.get(site)?.new_count ?? 0,
+          archivedCount: bySite.get(site)?.archived_count ?? 0,
           lastReceivedAt: bySite.get(site)?.last_received_at ?? null,
         })),
         channels: channelRows.rows,
@@ -148,7 +154,9 @@ export async function buildApp(config: Config, db: Db): Promise<FastifyInstance>
       }
       if (query.site) add((n) => `site = $${n}`, query.site)
       if (query.channel) add((n) => `channel = $${n}`, query.channel)
-      if (query.status && isStatus(query.status)) add((n) => `status = $${n}`, query.status)
+      // "active" = new + contacted, the dashboard's default view. No status at all = everything.
+      if (query.status === 'active') where.push(`status <> 'archived'`)
+      else if (query.status && isStatus(query.status)) add((n) => `status = $${n}`, query.status)
       const q = query.q?.trim().slice(0, 254)
       if (q?.includes('@')) {
         // Emails are encrypted, so an address is found by its exact blind index, not a partial match.
@@ -169,6 +177,42 @@ export async function buildApp(config: Config, db: Db): Promise<FastifyInstance>
         db.query<{ total: number }>(`select count(*)::int as total from submissions ${whereSql}`, params),
       ])
       return { total: count.rows[0]?.total ?? 0, limit, offset, submissions: list.rows.map((row) => toApi(keys, row)) }
+    })
+
+    /**
+     * Permanently deletes archived leads, for one site (`?site=s1`) or all. Only archived rows can be
+     * deleted, so a lead has to be archived first: two deliberate steps, never one click.
+     *
+     * `?expected=N` is the count the person confirmed. If the number of archived leads changed since
+     * (someone else archived more), nothing is deleted and 409 says how many there are now. Exactly
+     * the rows that were counted are deleted, never ones archived a moment later.
+     */
+    dashboard.delete('/v1/archived', async (req, reply) => {
+      const query = req.query as { site?: string; expected?: string }
+      const site = query.site?.trim() || null
+      const expected = query.expected === undefined ? null : Number.parseInt(query.expected, 10)
+      const client = await db.connect()
+      try {
+        await client.query('begin')
+        const scope = site ? `and site = $1` : ''
+        const { rows } = await client.query<{ id: string }>(
+          `select id from submissions where status = 'archived' ${scope} for update`,
+          site ? [site] : [],
+        )
+        if (expected !== null && rows.length !== expected) {
+          await client.query('rollback')
+          return reply.code(409).send({ ok: false, archived: rows.length, error: 'The number of archived leads changed.' })
+        }
+        await client.query('delete from submissions where id = any($1::uuid[])', [rows.map((row) => row.id)])
+        await client.query('commit')
+        await logAccess(db, 'archived_deleted', req.ip, { site: site ?? 'all', count: rows.length })
+        return { ok: true, deleted: rows.length }
+      } catch (error) {
+        await client.query('rollback').catch(() => {})
+        throw error
+      } finally {
+        client.release()
+      }
     })
 
     dashboard.patch('/v1/submissions/:id', async (req, reply) => {
