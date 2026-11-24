@@ -7,6 +7,14 @@ export function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(digest(a), digest(b))
 }
 
+/**
+ * First 8 hex characters of a value's SHA-256: safe to log, enough to tell whether a site sent the key
+ * you expect. Compare with: printf %s "$KEY" | shasum -a 256 | cut -c1-8
+ */
+export function fingerprint(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 8)
+}
+
 export function bearer(header: string | undefined): string {
   return header?.startsWith('Bearer ') ? header.slice(7).trim() : ''
 }

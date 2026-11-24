@@ -2,7 +2,7 @@ import cors from '@fastify/cors'
 import rateLimit from '@fastify/rate-limit'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { deriveChannel, readAttribution, toStored, type Attribution } from './attribution.js'
-import { bearer, issueSession, safeEqual, siteForKey, validSession } from './auth.js'
+import { bearer, fingerprint, issueSession, safeEqual, siteForKey, validSession } from './auth.js'
 import type { Config } from './config.js'
 import { dataKeys, decrypt, emailIndex, encrypt, type DataKeys } from './crypto.js'
 import { logAccess, type Db } from './db.js'
@@ -45,8 +45,16 @@ export async function buildApp(config: Config, db: Db): Promise<FastifyInstance>
   /* ── Ingest: called server-to-server by each site's form handler ───────────────────────── */
 
   app.post('/v1/submissions', { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } }, async (req, reply) => {
-    const site = siteForKey(config, bearer(req.headers.authorization))
-    if (!site) return reply.code(401).send({ ok: false, error: 'Unknown site key.' })
+    const key = bearer(req.headers.authorization)
+    const site = siteForKey(config, key)
+    if (!site) {
+      // Fingerprint, never the key: lets a mismatched SWITCHBOARD_API_KEY be compared with the expected one.
+      req.log.warn(
+        { keyFingerprint: key ? fingerprint(key) : null, keyLength: key.length, hasBearer: Boolean(req.headers.authorization?.startsWith('Bearer ')) },
+        'ingest rejected: unknown site key',
+      )
+      return reply.code(401).send({ ok: false, error: 'Unknown site key.' })
+    }
 
     const submission = readSubmission(req.body)
     if (!submission) return reply.code(400).send({ ok: false, error: 'Expected a JSON object with an email address.' })
